@@ -819,7 +819,7 @@ void setup_signal(int sig, void (*handler)(int sig))
 
 int main(int argc, char **argv)
 {
-	int i, start;
+	int i;
 	size_t n;
 	ssize_t len;
 	char *filename;
@@ -885,8 +885,6 @@ int main(int argc, char **argv)
 				free((void*) filename);
 			}
 			r_closedir(&dir);
-			if (fileidx - start > 1)
-				qsort(files + start, fileidx - start, sizeof(fileinfo_t), fncmp);
 		}
 	}
 

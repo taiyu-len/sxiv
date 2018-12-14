@@ -345,9 +345,11 @@ int tns_translate(tns_t*, int, int);
 #include <dirent.h>
 
 typedef struct {
-	DIR *dir;
 	char *name;
-	int d;
+	struct dirent **list;
+	int i;
+	int end;
+
 	bool recursive;
 
 	char **stack;

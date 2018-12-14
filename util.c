@@ -15,7 +15,7 @@
  * You should have received a copy of the GNU General Public License
  * along with sxiv.  If not, see <http://www.gnu.org/licenses/>.
  */
-
+#define _GNU_SOURCE
 #include "sxiv.h"
 
 #include <stdlib.h>
@@ -88,31 +88,66 @@ void size_readable(float *size, const char **unit)
 	*unit = units[MIN(i, ARRLEN(units) - 1)];
 }
 
+static
+int r_skip_dotfiles(const struct dirent *d)
+{
+	if (d->d_name[0] == '.')
+		return 0;
+	return 1;
+}
+
+static
+int r_no_skip_dotfiles(const struct dirent *d)
+{
+	if (STREQ(d->d_name, ".") || STREQ(d->d_name, ".."))
+		return 0;
+	return 1;
+}
+
+typedef int (*filter_t)(const struct dirent *);
+
+static
+filter_t r_filter(bool skip_dotfiles)
+{
+	if (skip_dotfiles)
+		return r_skip_dotfiles;
+	else
+		return r_no_skip_dotfiles;
+}
+
 int r_opendir(r_dir_t *rdir, const char *dirname, bool recursive)
 {
+	size_t len;
+
 	if (*dirname == '\0')
 		return -1;
 
-	if ((rdir->dir = opendir(dirname)) == NULL) {
-		rdir->name = NULL;
-		rdir->stack = NULL;
-		return -1;
-	}
+
+	rdir->name  = NULL;
+	rdir->recursive = recursive;
+	rdir->i = 0;
+	rdir->end = 0;
 
 	rdir->stcap = 512;
 	rdir->stack = (char**) emalloc(rdir->stcap * sizeof(char*));
-	rdir->stlen = 0;
+	rdir->stlen = 1;
+	rdir->stack[0] = estrdup(dirname);
 
-	rdir->name = (char*) dirname;
-	rdir->d = 0;
-	rdir->recursive = recursive;
+	len = strlen(rdir->stack[0]);
+	if (rdir->stack[0][len-1] == '/')
+		rdir->stack[0][len-1] = '\0';
 
 	return 0;
 }
 
 int r_closedir(r_dir_t *rdir)
 {
-	int ret = 0;
+	if (rdir->list) {
+		for (; rdir->i < rdir->end; rdir->i++) {
+			free(rdir->list[rdir->i]);
+		}
+		free(rdir->list);
+	}
 
 	if (rdir->stack != NULL) {
 		while (rdir->stlen > 0)
@@ -121,17 +156,10 @@ int r_closedir(r_dir_t *rdir)
 		rdir->stack = NULL;
 	}
 
-	if (rdir->dir != NULL) {
-		if ((ret = closedir(rdir->dir)) == 0)
-			rdir->dir = NULL;
-	}
+	free(rdir->name);
+	rdir->name = NULL;
 
-	if (rdir->d != 0) {
-		free(rdir->name);
-		rdir->name = NULL;
-	}
-
-	return ret;
+	return 0;
 }
 
 char* r_readdir(r_dir_t *rdir, bool skip_dotfiles)
@@ -141,51 +169,55 @@ char* r_readdir(r_dir_t *rdir, bool skip_dotfiles)
 	struct dirent *dentry;
 	struct stat fstats;
 
+
 	while (true) {
-		if (rdir->dir != NULL && (dentry = readdir(rdir->dir)) != NULL) {
-			if (dentry->d_name[0] == '.') {
-				if (skip_dotfiles)
-					continue;
-				if (dentry->d_name[1] == '\0')
-					continue;
-				if (dentry->d_name[1] == '.' && dentry->d_name[2] == '\0')
-					continue;
-			}
-
-			len = strlen(rdir->name) + strlen(dentry->d_name) + 2;
-			filename = (char*) emalloc(len);
-			snprintf(filename, len, "%s%s%s", rdir->name,
-			         rdir->name[strlen(rdir->name)-1] == '/' ? "" : "/",
-			         dentry->d_name);
-
-			if (stat(filename, &fstats) < 0)
-				continue;
-			if (S_ISDIR(fstats.st_mode)) {
-				/* put subdirectory on the stack */
-				if (rdir->stlen == rdir->stcap) {
-					rdir->stcap *= 2;
-					rdir->stack = (char**) erealloc(rdir->stack,
-					                                rdir->stcap * sizeof(char*));
-				}
-				rdir->stack[rdir->stlen++] = filename;
-				continue;
-			}
-			return filename;
+		if (rdir->name && rdir->i == rdir->end) {
+			/* finish scanning rdir->name */
+			free(rdir->name);
+			free(rdir->list);
+			rdir->name = NULL;
+			rdir->list = NULL;
 		}
-		
-		if (rdir->recursive && rdir->stlen > 0) {
-			/* open next subdirectory */
-			closedir(rdir->dir);
-			if (rdir->d != 0)
-				free(rdir->name);
+		if (rdir->name == NULL) {
+			/* open next subdirectory on stack if there are any */
+			if (rdir->stlen == 0) {
+				break;
+			}
 			rdir->name = rdir->stack[--rdir->stlen];
-			rdir->d = 1;
-			if ((rdir->dir = opendir(rdir->name)) == NULL)
+			rdir->end = scandir(rdir->name, &rdir->list,
+					  r_filter(skip_dotfiles),
+					  versionsort);
+			rdir->i = 0;
+			if (rdir->end < 0) {
 				error(0, errno, "%s", rdir->name);
+				rdir->end = 0;
+			}
 			continue;
 		}
-		/* no more entries */
-		break;
+
+		/* get filename for next entry in rdir->list */
+		dentry = rdir->list[rdir->i++];
+		len = strlen(rdir->name) + strlen(dentry->d_name) + 2;
+		filename = (char*) emalloc(len);
+		snprintf(filename, len, "%s/%s", rdir->name, dentry->d_name);
+		free(dentry);
+
+		if (stat(filename, &fstats) < 0)
+			continue;
+		if (S_ISDIR(fstats.st_mode)) {
+			if (! rdir->recursive)
+				continue;
+			/* put subdirectory on the stack */
+			if (rdir->stlen == rdir->stcap) {
+				rdir->stcap *= 2;
+				rdir->stack = (char**) erealloc(
+					rdir->stack,
+					rdir->stcap * sizeof(char*));
+			}
+			rdir->stack[rdir->stlen++] = filename;
+			continue;
+		}
+		return filename;
 	}
 	return NULL;
 }
